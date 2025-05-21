@@ -1,6 +1,6 @@
 cache/
 catboost_info/
-
+not_sub/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
