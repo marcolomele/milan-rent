@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import joblib
+from itertools import product
+import json
 
 from sklearn.model_selection import train_test_split, KFold, RandomizedSearchCV, GridSearchCV
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, VotingRegressor
@@ -333,3 +335,130 @@ if 'target_scaler' in locals() and target_scaler is not None:
     print(f"Saved target scaler to: {target_scaler_path}")
 
 print("\nAll models and parameters have been saved successfully.") 
+
+#%%
+# 8. GRANULAR GRID SEARCH AROUND BEST PARAMETERS
+# --------------------------------------------
+
+models_dir = 'model-runs'
+model_filename = 'best_xgboost_model_293.joblib'
+model_path = os.path.join(models_dir, model_filename)
+
+if os.path.exists(model_path):
+    loaded_xgb_model = joblib.load(model_path)
+    print(f"XGBoost model loaded successfully from {model_path}")
+else:
+    print(f"Error: Model file not found at {model_path}")
+    print("Please ensure you have run the cell to save the models.")
+
+best_params = loaded_xgb_model.get_params()
+
+# Define narrow ranges around best values for fine-tuning
+granular_params = {
+    'max_depth': [best_params['max_depth'] - 1, best_params['max_depth'], best_params['max_depth'] + 1],
+    'min_child_weight': [best_params['min_child_weight'] - 2, best_params['min_child_weight'], best_params['min_child_weight'] + 2],
+    'subsample': [max(0.8, best_params['subsample'] - 0.05), best_params['subsample'], min(1.0, best_params['subsample'] + 0.05)],
+    'colsample_bytree': [max(0.7, best_params['colsample_bytree'] - 0.05), best_params['colsample_bytree'], min(1.0, best_params['colsample_bytree'] + 0.05)],
+    'gamma': [max(0, best_params['gamma'] - 0.1), best_params['gamma'], best_params['gamma'] + 0.1]
+}
+
+# Function to perform grid search with early stopping
+def granular_grid_search(param_grid, base_params, X_train, y_train, X_dev, y_dev, cv_strategy=cv_strategy, early_stopping=50):
+    best_score = float('inf')
+    best_params = None
+    best_model = None
+    best_n_rounds = None
+    
+    # Generate all parameter combinations
+    param_combinations = [dict(zip(param_grid.keys(), v)) for v in product(*param_grid.values())]
+    
+    print(f"Testing {len(param_combinations)} parameter combinations...")
+    
+    for i, params_to_test in enumerate(param_combinations, 1):
+        # Update parameters
+        current_params = base_params.copy()
+        current_params.update(params_to_test)
+        
+        # Create and train model
+        model = xgb.XGBRegressor(
+            **current_params,
+            random_state=RANDOM_SEED,
+            n_jobs=-1,
+            early_stopping_rounds=early_stopping
+        )
+        
+        # Train with cross-validation
+        cv_scores = []
+        for train_idx, val_idx in cv_strategy.split(X_train):
+            X_train_cv, X_val_cv = X_train.iloc[train_idx], X_train.iloc[val_idx]
+            y_train_cv, y_val_cv = y_train.iloc[train_idx], y_train.iloc[val_idx]
+            
+            model.fit(
+                X_train_cv, y_train_cv,
+                eval_set=[(X_val_cv, y_val_cv)],
+                verbose=False
+            )
+            
+            # Get validation score
+            y_pred_cv = model.predict(X_val_cv)
+            cv_scores.append(mean_absolute_error(y_val_cv, y_pred_cv))
+        
+        # Average CV score
+        score = np.mean(cv_scores)
+        
+        if score < best_score:
+            best_score = score
+            best_params = params_to_test
+            best_model = model
+            best_n_rounds = model.best_iteration
+            print(f"\nNew best score ({i}/{len(param_combinations)}): {best_score}")
+            print("Parameters:", best_params)
+            print(f"Best number of rounds: {best_n_rounds}")
+    
+    return best_model, best_params, best_score, best_n_rounds
+
+# Run granular grid search
+print("\nPerforming granular grid search...")
+final_model, final_params, final_score, optimal_rounds = granular_grid_search(
+    granular_params,
+    best_params,
+    X_train,
+    y_train,
+    X_dev,
+    y_dev
+)
+
+# Print final results
+print('\nFinal Results after Granular Search ==========================')
+print(f'Best validation score (MAE): {final_score}')
+print('Final parameters ---------------------------')
+best_params.update(final_params)
+for k, v in best_params.items():
+    print(k, ':', v)
+print(f'Best number of rounds: {optimal_rounds}')
+
+# Save best configuration
+config_path = os.path.join(models_dir, 'best_xgboost_config.json')
+config = {
+    'parameters': best_params,
+    'optimal_rounds': optimal_rounds,
+    'validation_score': final_score
+}
+with open(config_path, 'w') as f:
+    json.dump(config, f, indent=4)
+print(f'\nSaved best configuration to: {config_path}')
+
+
+# Train final model on full training data with best parameters
+print('\nTraining final model on full training data...')
+ultimate_model = xgb.XGBRegressor(
+    **best_params,
+    random_state=RANDOM_SEED,
+    n_jobs=-1
+)
+ultimate_model.fit(X_full_train, y_full_train)
+
+# Save the ultimate model
+ultimate_model_path = os.path.join(models_dir, 'ultimate_xgboost_model.joblib')
+joblib.dump(ultimate_model, ultimate_model_path)
+print(f'\nSaved ultimate model to: {ultimate_model_path}')
